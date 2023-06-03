@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  This CloudFormation template deploys an application environment 
+  consisting of an Auto Scaling Group (ASG) with an Elastic Load 
+  Balancer (ELB) in AWS. The template allows you to choose the 
+  configuration parameters such as VPC, instance type, key pair 
+  environment type, and subnets.
+Parameters:
+  VPC:
+    Description: "Choose a VPC"
+    Type: AWS::EC2::VPC::Id
+
+  InstanceType:
+    Description: "Choose an instance type"
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t3.micro
+      - t2.nano
+
+  MyKeyPair:
+    Description: "Choose a key pair"
+    Type: AWS::EC2::KeyPair::KeyName
+
+  EnvParameter:
+    Description: "Choose an enviroment type"
+    Type: String
+    AllowedValues:
+      - prod
+      - test
+
+  Subnets:
+    Description: "Choose at least two subnets"
+    Type: List<AWS::EC2::Subnet::Id>
+
+Mappings:
+  RegionImageMap:
+    us-east-1:
+      prod: ami-0715c1897453cabd1
+      test: ami-0bef6cc322bfff646
+    us-east-2:
+      prod: ami-01107263728f3bef4
+      test: ami-05842f1afbf311a43
+    us-west-1:
+      prod: ami-0062dbf6b829f04e1
+      test: ami-04669a22aad391419
+    us-west-2:
+      prod: ami-0ab193018f3e9351b
+      test: ami-03c7c1f17ee073747
+    eu-west-1:
+      prod: ami-04f7efe62f419d9f5
+      test: ami-0e23c576dacf2e3df
+
+Resources:
+  MyASGPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref MyASG
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 60.0
+
+  MyASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: "ASGForALB"
+      DesiredCapacity: 2
+      HealthCheckGracePeriod: 200
+      HealthCheckType: ELB
+      LaunchTemplate:
+        LaunchTemplateId: !Ref MyLaunchTemplate
+        Version: 1
+      MaxSize: 4
+      MinSize: 1
+      TargetGroupARNs:
+        - !Ref MyTargetGrp # !GetAtt MyTargetGrp.TargetGroupArn
+      VPCZoneIdentifier: !Ref Subnets
+
+  MyListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref MyTargetGrp # !GetAtt MyTargetGrp.TargetGroupArn
+          Type: forward
+      LoadBalancerArn: !Ref MyELB
+      Port: 80
+      Protocol: HTTP
+
+  MyELB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: "ALBForASG"
+      SecurityGroups:
+        - !GetAtt MySecGrp.GroupId
+      Subnets: !Ref Subnets
+      Type: application
+
+  MyLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !FindInMap
+          - RegionImageMap
+          - !Ref "AWS::Region"
+          - !Ref EnvParameter
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref MyKeyPair
+        SecurityGroupIds:
+          - !GetAtt MySecGrp.GroupId # !Ref MySecGrp
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            update os
+            yum update -y
+            install apache server
+            yum install -y httpd
+            # get private ip address of ec2 instance using instance metadata
+            TOKEN=`curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"` \
+            && PRIVATE_IP=`curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4`
+            # get public ip address of ec2 instance using instance metadata
+            TOKEN=`curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"` \
+            && PUBLIC_IP=`curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4` 
+            # get date and time of server
+            DATE_TIME=`date`
+            # set all permissions
+            chmod -R 777 /var/www/html
+            # create a custom index.html file
+            echo "<html>
+            <head>
+                <title> Congratulations! You have created an instance from Launch Template</title>
+            </head>
+            <body>
+                <h1>This web server is launched from launch template by Yunus Altay</h1>
+                <p>This instance is created at <b>$DATE_TIME</b></p>
+                <p>Private IP address of this instance is <b>$PRIVATE_IP</b></p>
+                <p>Public IP address of this instance is <b>$PUBLIC_IP</b></p>
+            </body>
+            </html>" > /var/www/html/index.html
+            # start apache server
+            systemctl start httpd
+            systemctl enable httpd
+      LaunchTemplateName: MyTemplateASG
+
+  MyTargetGrp:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 3
+      IpAddressType: ipv4
+      Name: "TargetGrALB"
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId: !Ref VPC
+  MySecGrp:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Enable HTTP for Apache Web Server and SSH for secure connection"
+      GroupName: "ASGSecGroup"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref VPC
+
+Outputs:
+  WebSiteURL:
+    Description: "Url of the custom Website"
+    Value: !Join
+      - ""
+      - - "http://"
+        - !GetAtt MyELB.DNSName
